@@ -2,6 +2,11 @@
 #include "opendisplay/wire.hpp"
 
 #include <unistd.h>
+#include <sys/stat.h>
+#include <cstdlib>
+#include <filesystem>
+#include <stdexcept>
+#include <thread>
 
 #include <array>
 #include <cassert>
@@ -75,15 +80,93 @@ std::string probePixelFormat(const std::vector<od::EncodedFrame>& frames) {
     return output;
 }
 
+void waitForFailure(od::FfmpegEncoder& encoder) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (encoder.failure().empty() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    assert(!encoder.failure().empty());
+    const auto started = std::chrono::steady_clock::now();
+    encoder.stop();
+    assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(1));
+}
+
+void readerContainsCallbackExceptions() {
+    for (const bool standardException : {true, false}) {
+        od::FfmpegEncoder encoder;
+        encoder.start(od::EncoderConfig{.kind = od::EncoderKind::Software},
+                      [standardException](od::EncodedFrame) {
+            if (standardException) throw std::runtime_error("callback failed");
+            throw 42;
+        });
+        encoder.submit(testFrame(0));
+        waitForFailure(encoder);
+        assert(encoder.failure() == (standardException ? "callback failed"
+                                                       : "Unknown encoder error"));
+    }
+}
+
+void invalidOutputReportsFailureAndVaapiUsesOneAsyncFrame() {
+    char directory[] = "/tmp/opendisplay-ffmpeg-test-XXXXXX";
+    assert(::mkdtemp(directory) != nullptr);
+    const std::string executable = std::string(directory) + "/ffmpeg";
+    const std::string argumentFile = std::string(directory) + "/arguments";
+    {
+        std::ofstream script(executable);
+        script << "#!/bin/sh\n"
+                  "case \" $* \" in *' -encoders '*) echo h264_vaapi; exit 0;; esac\n"
+                  "printf '%s\\n' \"$@\" > " << argumentFile << "\n"
+                  "printf invalid-nut\n";
+    }
+    assert(::chmod(executable.c_str(), 0700) == 0);
+    const std::string oldPath = std::getenv("PATH");
+    assert(::setenv("PATH", (std::string(directory) + ':' + oldPath).c_str(), 1) == 0);
+    od::FfmpegEncoder encoder;
+    encoder.start(od::EncoderConfig{.kind = od::EncoderKind::Vaapi}, [](od::EncodedFrame) {
+        assert(false && "invalid NUT must not emit a frame");
+    });
+    encoder.submit(testFrame(0));
+    waitForFailure(encoder);
+    assert(encoder.failure().find("NUT stream") != std::string::npos);
+    std::ifstream file(argumentFile);
+    const std::string arguments((std::istreambuf_iterator<char>(file)), {});
+    assert(arguments.find("-async_depth\n1\n") != std::string::npos);
+    assert(arguments.find("format=nv12,hwupload") != std::string::npos);
+    // A child that never drains stdin must not hold stop() in write or join.
+    const std::string readyFile = std::string(directory) + "/ready";
+    {
+        std::ofstream script(executable);
+        script << "#!/bin/sh\n"
+                  "case \" $* \" in *' -encoders '*) echo h264_vaapi; exit 0;; esac\n"
+                  "touch " << readyFile << "\nexec sleep 30\n";
+    }
+    encoder.start(od::EncoderConfig{.kind = od::EncoderKind::Vaapi}, [](od::EncodedFrame) {});
+    assert(encoder.failure().empty());
+    encoder.submit(testFrame(0));
+    const auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!std::filesystem::exists(readyFile)
+           && std::chrono::steady_clock::now() < readyDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    assert(std::filesystem::exists(readyFile));
+    const auto stopped = std::chrono::steady_clock::now();
+    encoder.stop();
+    assert(std::chrono::steady_clock::now() - stopped < std::chrono::seconds(1));
+    assert(encoder.failure().empty());
+    assert(::setenv("PATH", oldPath.c_str(), 1) == 0);
+    std::filesystem::remove_all(directory);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool vaapi = argc == 2 && std::string_view(argv[1]) == "--vaapi";
     std::mutex mutex;
     std::condition_variable condition;
     std::vector<od::EncodedFrame> output;
     od::FfmpegEncoder encoder;
     encoder.start(od::EncoderConfig{
-        .kind = od::EncoderKind::Software,
+        .kind = vaapi ? od::EncoderKind::Vaapi : od::EncoderKind::Software,
         .outputWidth = 64,
         .outputHeight = 64,
         .fps = 30,
@@ -109,8 +192,20 @@ int main() {
         assert(output.size() == static_cast<std::size_t>(index) + 1);
         assert(output.back().capturedAtMs == 1000 + index);
     }
+    encoder.requestKeyframe();
+    encoder.submit(testFrame(frameCount));
+    {
+        std::unique_lock lock(mutex);
+        assert(condition.wait_for(lock, std::chrono::seconds(5), [&] {
+            return output.size() == frameCount + 1;
+        }));
+        assert(output.back().keyframe);
+        assert(output.back().capturedAtMs == 1000 + frameCount);
+        output.pop_back();
+    }
     encoder.stop();
     assert(output.size() == frameCount);
+    assert(encoder.failure().empty());
 
     assert(od::wire::containsAnnexBStartCode(output.front().annexB));
     assert(output.front().keyframe);
@@ -127,5 +222,9 @@ int main() {
     }
     // iPad hardware decoders need 8-bit 4:2:0, not the 4:4:4 libx264 picks for RGB.
     assert(probePixelFormat(output) == "yuv420p");
+    if (!vaapi) {
+        readerContainsCallbackExceptions();
+        invalidOutputReportsFailureAndVaapiUsesOneAsyncFrame();
+    }
     return 0;
 }

@@ -1,6 +1,8 @@
 #include "opendisplay/socket.hpp"
 
 #include <fcntl.h>
+#include <poll.h>
+#include <cerrno>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -11,6 +13,65 @@
 #include <thread>
 
 namespace {
+enum class MockIo { None, PartialSend, InterruptedSend, InterruptedPoll };
+thread_local MockIo mockIo = MockIo::None;
+thread_local long mockMs = 0;
+thread_local int sendCalls = 0;
+thread_local int pollCalls = 0;
+}
+
+extern "C" ssize_t __real_send(int, const void*, size_t, int);
+extern "C" int __real_poll(pollfd*, nfds_t, int);
+extern "C" std::chrono::steady_clock::time_point __real__ZNSt6chrono3_V212steady_clock3nowEv();
+
+extern "C" std::chrono::steady_clock::time_point __wrap__ZNSt6chrono3_V212steady_clock3nowEv() {
+    if (mockIo == MockIo::None) return __real__ZNSt6chrono3_V212steady_clock3nowEv();
+    return std::chrono::steady_clock::time_point(std::chrono::milliseconds(mockMs));
+}
+
+extern "C" ssize_t __wrap_send(int fd, const void* bytes, size_t size, int flags) {
+    if (mockIo == MockIo::None) return __real_send(fd, bytes, size, flags);
+    ++sendCalls;
+    if (mockIo == MockIo::InterruptedPoll) {
+        errno = EAGAIN;
+        return -1;
+    }
+    mockMs += 60;
+    if (mockIo == MockIo::InterruptedSend) {
+        errno = EINTR;
+        return sendCalls < 5 ? -1 : 0;
+    }
+    return 1;
+}
+
+extern "C" int __wrap_poll(pollfd* fds, nfds_t count, int timeout) {
+    if (mockIo == MockIo::None) return __real_poll(fds, count, timeout);
+    ++pollCalls;
+    mockMs += 60;
+    errno = EINTR;
+    return pollCalls < 5 ? -1 : 0;
+}
+
+namespace {
+
+void deadlineStopsPartialSendsAndInterruptedRetries() {
+    od::Socket writer;
+    for (const auto mode : {MockIo::PartialSend, MockIo::InterruptedSend,
+                            MockIo::InterruptedPoll}) {
+        mockIo = mode;
+        mockMs = 0;
+        sendCalls = pollCalls = 0;
+        assert(!writer.writeAll("data", std::chrono::milliseconds(100)));
+        assert(mockMs == 120);
+        assert(sendCalls == (mode == MockIo::InterruptedPoll ? 1 : 2));
+        assert(pollCalls == (mode == MockIo::InterruptedPoll ? 2 : 0));
+    }
+    mockMs = 0;
+    sendCalls = 0;
+    assert(!writer.writeAll("data", std::chrono::milliseconds(0)));
+    assert(sendCalls == 0);
+    mockIo = MockIo::None;
+}
 
 void makeNonblocking(const int fd) {
     const int flags = ::fcntl(fd, F_GETFL, 0);
@@ -123,6 +184,7 @@ void shutdownWakesBlockedRead() {
 }  // namespace
 
 int main() {
+    deadlineStopsPartialSendsAndInterruptedRetries();
     readsDelayedDataFromNonblockingSocket();
     writesThroughNonblockingBackpressure();
     writeGivesUpAtDeadlineWhenPeerStopsReading();

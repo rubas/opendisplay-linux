@@ -29,7 +29,11 @@ bool waitForSocket(const int fd, const short events, const std::optional<Clock::
     for (;;) {
         int timeoutMs = -1;
         if (deadline) {
-            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(*deadline - Clock::now());
+            const auto now = Clock::now();
+            if (now >= *deadline) {
+                return false;
+            }
+            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(*deadline - now);
             timeoutMs = static_cast<int>(std::max<std::chrono::milliseconds::rep>(0, remaining.count()));
         }
         const int result = ::poll(&descriptor, 1, timeoutMs);
@@ -103,6 +107,9 @@ bool Socket::writeAll(const std::string_view bytes, const std::chrono::milliseco
     const auto deadline = Clock::now() + timeout;
     std::size_t offset = 0;
     while (offset < bytes.size()) {
+        if (Clock::now() >= deadline) {
+            return false;
+        }
         const auto count = ::send(fd_, bytes.data() + offset, bytes.size() - offset,
                                   MSG_NOSIGNAL | MSG_DONTWAIT);
         if (count < 0) {

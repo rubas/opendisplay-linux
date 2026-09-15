@@ -207,6 +207,8 @@ if(BUILD_TESTING)
     target_include_directories(opendisplay-socket-tests PRIVATE include)
     target_link_libraries(opendisplay-socket-tests PRIVATE PkgConfig::USBMUXD Threads::Threads)
     target_compile_options(opendisplay-socket-tests PRIVATE -UNDEBUG)
+    target_link_options(opendisplay-socket-tests PRIVATE
+        -Wl,--wrap=send -Wl,--wrap=poll -Wl,--wrap=_ZNSt6chrono3_V212steady_clock3nowEv)
     add_test(NAME socket COMMAND opendisplay-socket-tests)
     set_tests_properties(socket PROPERTIES TIMEOUT 5)
 endif()

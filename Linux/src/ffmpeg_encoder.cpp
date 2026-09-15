@@ -139,6 +139,7 @@ void FfmpegEncoder::start(EncoderConfig config, FrameCallback callback) {
         std::lock_guard lock(mutex_);
         running_ = true;
         restartRequested_ = false;
+        failure_ = nullptr;
     }
     worker_ = std::thread(&FfmpegEncoder::run, this);
 }
@@ -167,6 +168,9 @@ void FfmpegEncoder::stop() {
         std::lock_guard lock(mutex_);
         running_ = false;
         pending_.reset();
+        if (childPid_ > 0) {
+            ::kill(childPid_, SIGKILL);
+        }
     }
     condition_.notify_all();
     if (worker_.joinable()) {
@@ -176,6 +180,41 @@ void FfmpegEncoder::stop() {
 }
 
 std::string FfmpegEncoder::selectedEncoder() const { return encoderName(selected_); }
+
+std::string FfmpegEncoder::failure() const {
+    std::exception_ptr error;
+    {
+        std::lock_guard lock(mutex_);
+        error = failure_;
+    }
+    if (!error) {
+        return {};
+    }
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& failure) {
+        return failure.what();
+    } catch (...) {
+        return "Unknown encoder error";
+    }
+}
+
+void FfmpegEncoder::fail(std::exception_ptr error) {
+    {
+        std::lock_guard lock(mutex_);
+        if (!running_ || processStopping_) {
+            return;
+        }
+        // Preserve the exception without allocating from a failing reader thread.
+        failure_ = std::move(error);
+        running_ = false;
+        pending_.reset();
+        if (childPid_ > 0) {
+            ::kill(childPid_, SIGKILL);
+        }
+    }
+    condition_.notify_all();
+}
 
 EncoderKind FfmpegEncoder::chooseEncoder() const {
     if (config_.kind != EncoderKind::Auto) {
@@ -218,7 +257,8 @@ std::vector<std::string> FfmpegEncoder::arguments(const VideoFormat& input) cons
     // iPad hardware decoders accept 8-bit 4:2:0 only; without an explicit
     // format libx264 would pick High 4:4:4 Predictive for RGB input.
     if (selected_ == EncoderKind::Vaapi) {
-        args.insert(args.end(), {"-vf", scale + ",format=nv12,hwupload", "-c:v", "h264_vaapi"});
+        args.insert(args.end(), {"-vf", scale + ",format=nv12,hwupload", "-c:v", "h264_vaapi",
+                                 "-async_depth", "1"});
     } else if (selected_ == EncoderKind::Nvenc) {
         args.insert(args.end(), {"-vf", scale + ",format=yuv420p", "-c:v", "h264_nvenc",
                                  "-preset", "p1", "-tune", "ull", "-delay", "0"});
@@ -240,6 +280,11 @@ std::vector<std::string> FfmpegEncoder::arguments(const VideoFormat& input) cons
 }
 
 void FfmpegEncoder::startProcess(const VideoFormat& input) {
+    std::lock_guard lock(mutex_);
+    if (!running_) {
+        return;
+    }
+    processStopping_ = false;
     int inputPipe[2]{};
     int outputPipe[2]{};
     if (::pipe2(inputPipe, O_CLOEXEC) != 0 || ::pipe2(outputPipe, O_CLOEXEC) != 0) {
@@ -278,6 +323,13 @@ void FfmpegEncoder::startProcess(const VideoFormat& input) {
 }
 
 void FfmpegEncoder::stopProcess() {
+    {
+        std::lock_guard lock(mutex_);
+        processStopping_ = true;
+        if (childPid_ > 0) {
+            ::kill(childPid_, SIGKILL);
+        }
+    }
     if (inputFd_ >= 0) {
         ::close(inputFd_);
         inputFd_ = -1;
@@ -286,10 +338,13 @@ void FfmpegEncoder::stopProcess() {
         reader_.join();
     }
     outputFd_ = -1;
-    if (childPid_ > 0) {
-        int status = 0;
-        while (::waitpid(childPid_, &status, 0) < 0 && errno == EINTR) {}
-        childPid_ = -1;
+    {
+        std::lock_guard lock(mutex_);
+        if (childPid_ > 0) {
+            int status = 0;
+            while (::waitpid(childPid_, &status, 0) < 0 && errno == EINTR) {}
+            childPid_ = -1;
+        }
     }
     inputFormat_ = {};
     {
@@ -329,56 +384,63 @@ void FfmpegEncoder::run() {
                 timestamps_.push_back(frame.capturedAtMs);
             }
             if (!writeAll(inputFd_, frame.bytes)) {
-                log("FFmpeg stopped accepting frames; restarting it");
-                stopProcess();
-                startProcess(frame.format);
-                {
-                    std::lock_guard lock(mutex_);
-                    timestamps_.push_back(frame.capturedAtMs);
-                }
-                if (!writeAll(inputFd_, frame.bytes)) {
-                    throw std::runtime_error("FFmpeg encoder pipe failed");
-                }
+                throw std::runtime_error("FFmpeg encoder pipe failed");
             }
         }
-    } catch (const std::exception& error) {
-        log(std::string("Encoder error: ") + error.what());
-        std::lock_guard lock(mutex_);
-        running_ = false;
+    } catch (...) {
+        fail(std::current_exception());
     }
     stopProcess();
 }
 
 void FfmpegEncoder::readOutput(const int fd) {
     constexpr int bufferSize = 64 * 1024;
-    auto* buffer = static_cast<unsigned char*>(av_malloc(bufferSize));
-    AVIOContext* io = avio_alloc_context(buffer, bufferSize, 0,
-                                         reinterpret_cast<void*>(static_cast<std::intptr_t>(fd)),
-                                         &readPipe, nullptr, nullptr);
-    AVFormatContext* format = avformat_alloc_context();
-    if (buffer == nullptr || io == nullptr || format == nullptr) {
-        throw std::runtime_error("cannot allocate FFmpeg demuxer");
-    }
-    format->pb = io;
-    // The NUT stream header already names the codec; parsers would hold the
-    // last access unit back until the following one arrives.
-    format->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_NOPARSE | AVFMT_FLAG_NOFILLIN;
-    AVPacket* packet = av_packet_alloc();
-    if (avformat_open_input(&format, nullptr, av_find_input_format("nut"), nullptr) == 0) {
-        while (av_read_frame(format, packet) == 0) {
+    unsigned char* buffer = nullptr;
+    AVIOContext* io = nullptr;
+    AVFormatContext* format = nullptr;
+    AVPacket* packet = nullptr;
+    try {
+        buffer = static_cast<unsigned char*>(av_malloc(bufferSize));
+        if (buffer == nullptr) {
+            throw std::runtime_error("cannot allocate FFmpeg input buffer");
+        }
+        io = avio_alloc_context(buffer, bufferSize, 0,
+                                reinterpret_cast<void*>(static_cast<std::intptr_t>(fd)),
+                                &readPipe, nullptr, nullptr);
+        if (io == nullptr) {
+            throw std::runtime_error("cannot allocate FFmpeg input context");
+        }
+        format = avformat_alloc_context();
+        packet = av_packet_alloc();
+        if (format == nullptr || packet == nullptr) {
+            throw std::runtime_error("cannot allocate FFmpeg demuxer");
+        }
+        format->pb = io;
+        // NUT headers name the codec. Parsing would hold the last frame back.
+        format->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_NOPARSE | AVFMT_FLAG_NOFILLIN;
+        int result = avformat_open_input(&format, nullptr, av_find_input_format("nut"), nullptr);
+        if (result < 0) {
+            throw std::runtime_error("FFmpeg produced no NUT stream (error "
+                                     + std::to_string(result) + ')');
+        }
+        while ((result = av_read_frame(format, packet)) >= 0) {
             const std::string_view payload(reinterpret_cast<const char*>(packet->data),
-                                           static_cast<std::size_t>(packet->size));
+                                          static_cast<std::size_t>(packet->size));
             emitPacket(withFourByteStartCodes(payload), (packet->flags & AV_PKT_FLAG_KEY) != 0);
             av_packet_unref(packet);
         }
-        avformat_close_input(&format);
-    } else {
-        log("FFmpeg produced no NUT stream");
-        avformat_free_context(format);
+        throw std::runtime_error("FFmpeg output ended (error " + std::to_string(result) + ')');
+    } catch (...) {
+        fail(std::current_exception());
     }
+    avformat_close_input(&format);
     av_packet_free(&packet);
-    av_freep(&io->buffer);
-    avio_context_free(&io);
+    if (io != nullptr) {
+        av_freep(&io->buffer);
+        avio_context_free(&io);
+    } else {
+        av_free(buffer);
+    }
     ::close(fd);
 }
 

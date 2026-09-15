@@ -210,6 +210,10 @@ void Session::receiveLoop() {
 }
 
 bool Session::tick() {
+    if (const auto encoderError = encoder_.failure(); !encoderError.empty()) {
+        stop();
+        throw std::runtime_error("FFmpeg encoder failed: " + encoderError);
+    }
     if (const auto captureError = capture_.error()) {
         throw std::runtime_error("PipeWire capture failed: " + *captureError);
     }

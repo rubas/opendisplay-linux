@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -28,8 +29,6 @@ struct EncoderConfig {
 /// single pending frame, preventing latency from growing under encoder load.
 /// FFmpeg writes packetized NUT, so every access unit is delivered as soon as
 /// its packet is complete, without waiting for the next frame.
-/// FFmpeg writes packetized NUT so every encoded frame is delivered as soon
-/// as its packet is complete, without waiting for the next frame.
 class FfmpegEncoder {
 public:
     using FrameCallback = std::function<void(EncodedFrame)>;
@@ -49,6 +48,7 @@ public:
 
 private:
     void run();
+    void fail(std::exception_ptr error);
     void startProcess(const VideoFormat& input);
     void stopProcess();
     void readOutput(int fd);
@@ -65,13 +65,14 @@ private:
     std::thread worker_;
     std::thread reader_;
     bool running_ = false;
+    bool processStopping_ = false;
     bool restartRequested_ = false;
     int inputFd_ = -1;
     int outputFd_ = -1;
     int childPid_ = -1;
     VideoFormat inputFormat_;
     EncoderKind selected_ = EncoderKind::Software;
-    std::string failure_;
+    std::exception_ptr failure_;
 };
 
 }  // namespace od
