@@ -56,8 +56,68 @@ void writesThroughNonblockingBackpressure() {
         ::close(fd);
     });
 
-    assert(writer.writeAll(payload));
+    assert(writer.writeAll(payload, std::chrono::seconds(5)));
     reader.join();
+}
+
+using Clock = std::chrono::steady_clock;
+
+od::Socket stalledWriter(int pair[2]) {
+    assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    const int sendBuffer = 4096;
+    assert(::setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &sendBuffer,
+                        sizeof(sendBuffer)) == 0);
+    return od::Socket(pair[0]);
+}
+
+void writeGivesUpAtDeadlineWhenPeerStopsReading() {
+    int pair[2]{};
+    od::Socket writer = stalledWriter(pair);
+    const std::string payload(1024 * 1024, 'x');
+
+    const auto started = Clock::now();
+    assert(!writer.writeAll(payload, std::chrono::milliseconds(100)));
+    const auto elapsed = Clock::now() - started;
+    assert(elapsed >= std::chrono::milliseconds(100));
+    assert(elapsed < std::chrono::seconds(1));
+    ::close(pair[1]);
+}
+
+void shutdownWakesBlockedWrite() {
+    int pair[2]{};
+    od::Socket writer = stalledWriter(pair);
+    const std::string payload(1024 * 1024, 'x');
+    bool written = true;
+    std::thread sender([&] { written = writer.writeAll(payload, std::chrono::seconds(10)); });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto started = Clock::now();
+    writer.shutdown();
+    sender.join();
+    assert(!written);
+    assert(Clock::now() - started < std::chrono::seconds(1));
+    assert(writer.valid());
+    ::close(pair[1]);
+}
+
+void shutdownWakesBlockedRead() {
+    int pair[2]{};
+    assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    od::Socket reader(pair[0]);
+    bool read = true;
+    std::thread receiver([&] {
+        std::array<char, 4> header{};
+        read = reader.readExact(header);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto started = Clock::now();
+    reader.shutdown();
+    receiver.join();
+    assert(!read);
+    assert(Clock::now() - started < std::chrono::seconds(1));
+    assert(reader.valid());
+    ::close(pair[1]);
 }
 
 }  // namespace
@@ -65,4 +125,7 @@ void writesThroughNonblockingBackpressure() {
 int main() {
     readsDelayedDataFromNonblockingSocket();
     writesThroughNonblockingBackpressure();
+    writeGivesUpAtDeadlineWhenPeerStopsReading();
+    shutdownWakesBlockedWrite();
+    shutdownWakesBlockedRead();
 }
