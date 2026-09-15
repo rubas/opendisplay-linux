@@ -28,7 +28,7 @@ public:
     void shutdown();
     void close();
     bool readExact(std::span<char> destination);
-    /// Sends every byte or gives up once the peer stops reading for `timeout`.
+    /// Sends every byte within a total deadline of `timeout`.
     bool writeAll(std::string_view bytes, std::chrono::milliseconds timeout);
 
 private:

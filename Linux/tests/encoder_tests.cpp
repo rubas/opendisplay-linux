@@ -142,7 +142,12 @@ void invalidOutputReportsFailureAndVaapiUsesOneAsyncFrame() {
     }
     encoder.start(od::EncoderConfig{.kind = od::EncoderKind::Vaapi}, [](od::EncodedFrame) {});
     assert(encoder.failure().empty());
-    encoder.submit(testFrame(0));
+    auto largeFrame = testFrame(0);
+    largeFrame.format.width = 2752;
+    largeFrame.format.height = 2064;
+    largeFrame.format.stride = 2752 * 4;
+    largeFrame.bytes.resize(2752 * 2064 * 4);
+    encoder.submit(std::move(largeFrame));
     const auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (!std::filesystem::exists(readyFile)
            && std::chrono::steady_clock::now() < readyDeadline) {
