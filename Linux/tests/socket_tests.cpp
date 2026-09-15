@@ -1,77 +1,20 @@
 #include "opendisplay/socket.hpp"
 
 #include <fcntl.h>
-#include <poll.h>
-#include <cerrno>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <string>
 #include <thread>
 
 namespace {
-enum class MockIo { None, PartialSend, InterruptedSend, InterruptedPoll };
-thread_local MockIo mockIo = MockIo::None;
-thread_local long mockMs = 0;
-thread_local int sendCalls = 0;
-thread_local int pollCalls = 0;
-}
-
-extern "C" ssize_t __real_send(int, const void*, size_t, int);
-extern "C" int __real_poll(pollfd*, nfds_t, int);
-extern "C" std::chrono::steady_clock::time_point __real__ZNSt6chrono3_V212steady_clock3nowEv();
-
-extern "C" std::chrono::steady_clock::time_point __wrap__ZNSt6chrono3_V212steady_clock3nowEv() {
-    if (mockIo == MockIo::None) return __real__ZNSt6chrono3_V212steady_clock3nowEv();
-    return std::chrono::steady_clock::time_point(std::chrono::milliseconds(mockMs));
-}
-
-extern "C" ssize_t __wrap_send(int fd, const void* bytes, size_t size, int flags) {
-    if (mockIo == MockIo::None) return __real_send(fd, bytes, size, flags);
-    ++sendCalls;
-    if (mockIo == MockIo::InterruptedPoll) {
-        errno = EAGAIN;
-        return -1;
-    }
-    mockMs += 60;
-    if (mockIo == MockIo::InterruptedSend) {
-        errno = EINTR;
-        return sendCalls < 5 ? -1 : 0;
-    }
-    return 1;
-}
-
-extern "C" int __wrap_poll(pollfd* fds, nfds_t count, int timeout) {
-    if (mockIo == MockIo::None) return __real_poll(fds, count, timeout);
-    ++pollCalls;
-    mockMs += 60;
-    errno = EINTR;
-    return pollCalls < 5 ? -1 : 0;
-}
-
-namespace {
-
-void deadlineStopsPartialSendsAndInterruptedRetries() {
-    od::Socket writer;
-    for (const auto mode : {MockIo::PartialSend, MockIo::InterruptedSend,
-                            MockIo::InterruptedPoll}) {
-        mockIo = mode;
-        mockMs = 0;
-        sendCalls = pollCalls = 0;
-        assert(!writer.writeAll("data", std::chrono::milliseconds(100)));
-        assert(mockMs == 120);
-        assert(sendCalls == (mode == MockIo::InterruptedPoll ? 1 : 2));
-        assert(pollCalls == (mode == MockIo::InterruptedPoll ? 2 : 0));
-    }
-    mockMs = 0;
-    sendCalls = 0;
-    assert(!writer.writeAll("data", std::chrono::milliseconds(0)));
-    assert(sendCalls == 0);
-    mockIo = MockIo::None;
-}
 
 void makeNonblocking(const int fd) {
     const int flags = ::fcntl(fd, F_GETFL, 0);
@@ -144,6 +87,77 @@ void writeGivesUpAtDeadlineWhenPeerStopsReading() {
     ::close(pair[1]);
 }
 
+/// A peer that drains slowly keeps every send short and positive. The deadline
+/// is total: progress must not restart it.
+void writeGivesUpAtDeadlineWhilePeerDrainsSlowly() {
+    int pair[2]{};
+    od::Socket writer = stalledWriter(pair);
+    const std::string payload(1024 * 1024, 'x');
+    std::atomic<bool> done = false;
+    std::size_t received = 0;
+    std::thread reader([&, fd = pair[1]] {
+        std::array<char, 1024> buffer{};
+        while (!done) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            const auto count = ::recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
+            received += count > 0 ? static_cast<std::size_t>(count) : 0;
+        }
+    });
+
+    const auto started = Clock::now();
+    assert(!writer.writeAll(payload, std::chrono::milliseconds(100)));
+    const auto elapsed = Clock::now() - started;
+    done = true;
+    reader.join();
+    assert(elapsed >= std::chrono::milliseconds(100));
+    assert(elapsed < std::chrono::seconds(1));
+    assert(received > 0);
+    assert(received < payload.size());
+    ::close(pair[1]);
+}
+
+std::atomic<int> interrupts = 0;
+
+void countInterrupt(int) { interrupts.fetch_add(1); }
+
+/// Signals interrupt the wait with EINTR every few milliseconds. The wait must
+/// resume with the remaining time, not the full timeout.
+void writeGivesUpAtDeadlineAcrossInterruptedWaits() {
+    struct sigaction action{};
+    action.sa_handler = countInterrupt;
+    assert(::sigaction(SIGUSR1, &action, nullptr) == 0);
+    int pair[2]{};
+    od::Socket writer = stalledWriter(pair);
+    const std::string payload(1024 * 1024, 'x');
+    std::atomic<bool> done = false;
+    std::thread interrupter([&, target = ::pthread_self()] {
+        for (int round = 0; round < 400 && !done; ++round) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            ::pthread_kill(target, SIGUSR1);
+        }
+    });
+
+    const auto started = Clock::now();
+    assert(!writer.writeAll(payload, std::chrono::milliseconds(100)));
+    const auto elapsed = Clock::now() - started;
+    done = true;
+    interrupter.join();
+    assert(interrupts > 0);
+    assert(elapsed >= std::chrono::milliseconds(100));
+    assert(elapsed < std::chrono::seconds(1));
+    ::close(pair[1]);
+}
+
+void zeroTimeoutSendsNothing() {
+    int pair[2]{};
+    assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    od::Socket writer(pair[0]);
+    assert(!writer.writeAll("data", std::chrono::milliseconds(0)));
+    char byte = 0;
+    assert(::recv(pair[1], &byte, 1, MSG_DONTWAIT) < 0 && errno == EAGAIN);
+    ::close(pair[1]);
+}
+
 void shutdownWakesBlockedWrite() {
     int pair[2]{};
     od::Socket writer = stalledWriter(pair);
@@ -184,10 +198,12 @@ void shutdownWakesBlockedRead() {
 }  // namespace
 
 int main() {
-    deadlineStopsPartialSendsAndInterruptedRetries();
     readsDelayedDataFromNonblockingSocket();
     writesThroughNonblockingBackpressure();
     writeGivesUpAtDeadlineWhenPeerStopsReading();
+    writeGivesUpAtDeadlineWhilePeerDrainsSlowly();
+    writeGivesUpAtDeadlineAcrossInterruptedWaits();
+    zeroTimeoutSendsNothing();
     shutdownWakesBlockedWrite();
     shutdownWakesBlockedRead();
 }

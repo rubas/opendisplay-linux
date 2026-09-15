@@ -10,6 +10,7 @@ extern "C" {
 }
 
 #include <fcntl.h>
+#include <spawn.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -22,6 +23,8 @@ extern "C" {
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
+
+extern char** environ;
 
 namespace od {
 namespace {
@@ -105,6 +108,27 @@ std::string withFourByteStartCodes(const std::string_view packet) {
         position = next;
     }
     return annexB;
+}
+
+/// Starts `argv` with `stdinFd` and `stdoutFd` as its standard streams. Every
+/// other descriptor of this process is close-on-exec. Returns an errno value.
+int spawn(char* const argv[], const int stdinFd, const int stdoutFd, pid_t& pid) {
+    posix_spawn_file_actions_t actions;
+    int error = ::posix_spawn_file_actions_init(&actions);
+    if (error != 0) {
+        return error;
+    }
+    // A pipe end that already sits on 0 or 1 keeps its number; dup2 onto the
+    // same descriptor only clears close-on-exec.
+    error = ::posix_spawn_file_actions_adddup2(&actions, stdinFd, STDIN_FILENO);
+    if (error == 0) {
+        error = ::posix_spawn_file_actions_adddup2(&actions, stdoutFd, STDOUT_FILENO);
+    }
+    if (error == 0) {
+        error = ::posix_spawnp(&pid, argv[0], &actions, nullptr, argv, environ);
+    }
+    ::posix_spawn_file_actions_destroy(&actions);
+    return error;
 }
 
 int readPipe(void* opaque, std::uint8_t* buffer, const int size) {
@@ -264,17 +288,22 @@ std::vector<std::string> FfmpegEncoder::arguments(const VideoFormat& input) cons
                                  "-preset", "p1", "-tune", "ull", "-delay", "0"});
     } else {
         args.insert(args.end(), {"-vf", scale + ",format=yuv420p", "-c:v", "libx264",
-                                 "-preset", "ultrafast", "-tune", "zerolatency",
-                                 "-x264-params", "repeat-headers=1:aud=1"});
+                                 "-preset", "ultrafast", "-tune", "zerolatency"});
     }
     // NUT carries packet boundaries, so the reader emits each access unit as
     // soon as FFmpeg flushes it instead of waiting for the next start code.
+    // NUT takes SPS and PPS as global headers. libx264 and NVENC then leave
+    // them out of the stream, so dump_extra puts that one copy in front of
+    // every keyframe; VA-API writes its own copy in front of every IDR.
+    std::string filters = "h264_metadata=aud=insert";
+    if (selected_ != EncoderKind::Vaapi) {
+        filters += ",dump_extra=freq=keyframe";
+    }
     args.insert(args.end(), {
         "-bf", "0", "-g", std::to_string(std::max(config_.fps * 60, config_.fps)),
         "-b:v", std::to_string(config_.bitrate), "-maxrate", std::to_string(config_.bitrate),
         "-bufsize", std::to_string(std::max(config_.bitrate / 2, 1)),
-        "-bsf:v", "h264_metadata=aud=insert,dump_extra=freq=keyframe",
-        "-f", "nut", "-flush_packets", "1", "pipe:1",
+        "-bsf:v", filters, "-f", "nut", "-flush_packets", "1", "pipe:1",
     });
     return args;
 }
@@ -287,34 +316,28 @@ void FfmpegEncoder::startProcess(const VideoFormat& input) {
     processStopping_ = false;
     int inputPipe[2]{};
     int outputPipe[2]{};
-    if (::pipe2(inputPipe, O_CLOEXEC) != 0 || ::pipe2(outputPipe, O_CLOEXEC) != 0) {
-        if (inputPipe[0] > 0) ::close(inputPipe[0]);
-        if (inputPipe[1] > 0) ::close(inputPipe[1]);
-        throw std::runtime_error("cannot create FFmpeg pipes");
+    if (::pipe2(inputPipe, O_CLOEXEC) != 0) {
+        throw std::runtime_error("cannot create FFmpeg input pipe");
+    }
+    if (::pipe2(outputPipe, O_CLOEXEC) != 0) {
+        ::close(inputPipe[0]); ::close(inputPipe[1]);
+        throw std::runtime_error("cannot create FFmpeg output pipe");
     }
     const auto args = arguments(input);
-    const pid_t pid = ::fork();
-    if (pid < 0) {
-        ::close(inputPipe[0]); ::close(inputPipe[1]);
-        ::close(outputPipe[0]); ::close(outputPipe[1]);
-        throw std::runtime_error("cannot fork FFmpeg");
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& argument : args) {
+        argv.push_back(const_cast<char*>(argument.c_str()));
     }
-    if (pid == 0) {
-        ::dup2(inputPipe[0], STDIN_FILENO);
-        ::dup2(outputPipe[1], STDOUT_FILENO);
-        ::close(inputPipe[0]); ::close(inputPipe[1]);
-        ::close(outputPipe[0]); ::close(outputPipe[1]);
-        std::vector<char*> argv;
-        argv.reserve(args.size() + 1);
-        for (const auto& argument : args) {
-            argv.push_back(const_cast<char*>(argument.c_str()));
-        }
-        argv.push_back(nullptr);
-        ::execvp(argv.front(), argv.data());
-        _exit(127);
-    }
+    argv.push_back(nullptr);
+    pid_t pid = -1;
+    const int error = spawn(argv.data(), inputPipe[0], outputPipe[1], pid);
     ::close(inputPipe[0]);
     ::close(outputPipe[1]);
+    if (error != 0) {
+        ::close(inputPipe[1]); ::close(outputPipe[0]);
+        throw std::runtime_error(std::string("cannot start ffmpeg: ") + std::strerror(error));
+    }
     inputFd_ = inputPipe[1];
     outputFd_ = outputPipe[0];
     childPid_ = static_cast<int>(pid);
