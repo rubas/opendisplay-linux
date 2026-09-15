@@ -2,6 +2,13 @@
 
 #include "opendisplay/log.hpp"
 
+extern "C" {
+#include <libavcodec/packet.h>
+#include <libavformat/avformat.h>
+#include <libavformat/avio.h>
+#include <libavutil/mem.h>
+}
+
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -71,14 +78,6 @@ bool writeAll(const int fd, const std::string_view bytes) {
     return true;
 }
 
-std::size_t startCodeLength(const std::string_view bytes, const std::size_t position) {
-    if (position + 3 < bytes.size() && bytes[position] == 0 && bytes[position + 1] == 0
-        && bytes[position + 2] == 0 && bytes[position + 3] == 1) {
-        return 4;
-    }
-    return 3;
-}
-
 std::size_t findStartCode(const std::string_view bytes, const std::size_t from) {
     for (std::size_t index = from; index + 2 < bytes.size(); ++index) {
         if (bytes[index] == 0 && bytes[index + 1] == 0
@@ -89,6 +88,40 @@ std::size_t findStartCode(const std::string_view bytes, const std::size_t from) 
         }
     }
     return std::string::npos;
+}
+
+// FFmpeg's bitstream filters mix three- and four-byte delimiters. The iOS
+// receiver recognizes only the four-byte form, matching the macOS sender.
+std::string withFourByteStartCodes(const std::string_view packet) {
+    std::string annexB;
+    annexB.reserve(packet.size() + 16);
+    std::size_t position = findStartCode(packet, 0);
+    while (position != std::string::npos) {
+        if (packet[position + 2] == 1) {
+            annexB.push_back('\0');
+        }
+        const auto next = findStartCode(packet, position + 3);
+        annexB.append(packet.substr(position, next - position));
+        position = next;
+    }
+    return annexB;
+}
+
+int readPipe(void* opaque, std::uint8_t* buffer, const int size) {
+    const int fd = static_cast<int>(reinterpret_cast<std::intptr_t>(opaque));
+    for (;;) {
+        const auto count = ::read(fd, buffer, static_cast<std::size_t>(size));
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            return AVERROR(errno);
+        }
+        if (count == 0) {
+            return AVERROR_EOF;
+        }
+        return static_cast<int>(count);
+    }
 }
 
 }  // namespace
@@ -182,22 +215,26 @@ std::vector<std::string> FfmpegEncoder::arguments(const VideoFormat& input) cons
 
     const std::string scale = "scale=" + std::to_string(outputWidth) + ':'
         + std::to_string(outputHeight) + ":flags=fast_bilinear";
+    // iPad hardware decoders accept 8-bit 4:2:0 only; without an explicit
+    // format libx264 would pick High 4:4:4 Predictive for RGB input.
     if (selected_ == EncoderKind::Vaapi) {
         args.insert(args.end(), {"-vf", scale + ",format=nv12,hwupload", "-c:v", "h264_vaapi"});
     } else if (selected_ == EncoderKind::Nvenc) {
-        args.insert(args.end(), {"-vf", scale, "-c:v", "h264_nvenc", "-preset", "p1",
-                                 "-tune", "ull", "-delay", "0"});
+        args.insert(args.end(), {"-vf", scale + ",format=yuv420p", "-c:v", "h264_nvenc",
+                                 "-preset", "p1", "-tune", "ull", "-delay", "0"});
     } else {
-        args.insert(args.end(), {"-vf", scale, "-c:v", "libx264", "-preset", "ultrafast",
-                                 "-tune", "zerolatency",
+        args.insert(args.end(), {"-vf", scale + ",format=yuv420p", "-c:v", "libx264",
+                                 "-preset", "ultrafast", "-tune", "zerolatency",
                                  "-x264-params", "repeat-headers=1:aud=1"});
     }
+    // NUT carries packet boundaries, so the reader emits each access unit as
+    // soon as FFmpeg flushes it instead of waiting for the next start code.
     args.insert(args.end(), {
         "-bf", "0", "-g", std::to_string(std::max(config_.fps * 60, config_.fps)),
         "-b:v", std::to_string(config_.bitrate), "-maxrate", std::to_string(config_.bitrate),
         "-bufsize", std::to_string(std::max(config_.bitrate / 2, 1)),
         "-bsf:v", "h264_metadata=aud=insert,dump_extra=freq=keyframe",
-        "-f", "h264", "pipe:1",
+        "-f", "nut", "-flush_packets", "1", "pipe:1",
     });
     return args;
 }
@@ -313,67 +350,42 @@ void FfmpegEncoder::run() {
 }
 
 void FfmpegEncoder::readOutput(const int fd) {
-    std::array<char, 64 * 1024> buffer{};
-    std::string pending;
-    std::string accessUnit;
-    bool hasVcl = false;
-    for (;;) {
-        const auto count = ::read(fd, buffer.data(), buffer.size());
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count <= 0) {
-            break;
-        }
-        pending.append(buffer.data(), static_cast<std::size_t>(count));
-        for (;;) {
-            const auto first = findStartCode(pending, 0);
-            if (first == std::string::npos) {
-                break;
-            }
-            if (first > 0) {
-                pending.erase(0, first);
-            }
-            const auto next = findStartCode(pending, startCodeLength(pending, 0));
-            if (next == std::string::npos) {
-                break;
-            }
-            auto nal = pending.substr(0, next);
-            pending.erase(0, next);
-            consumeNal(std::move(nal), accessUnit, hasVcl);
-        }
+    constexpr int bufferSize = 64 * 1024;
+    auto* buffer = static_cast<unsigned char*>(av_malloc(bufferSize));
+    AVIOContext* io = avio_alloc_context(buffer, bufferSize, 0,
+                                         reinterpret_cast<void*>(static_cast<std::intptr_t>(fd)),
+                                         &readPipe, nullptr, nullptr);
+    AVFormatContext* format = avformat_alloc_context();
+    if (buffer == nullptr || io == nullptr || format == nullptr) {
+        throw std::runtime_error("cannot allocate FFmpeg demuxer");
     }
-    if (!pending.empty() && findStartCode(pending, 0) == 0) {
-        consumeNal(std::move(pending), accessUnit, hasVcl);
+    format->pb = io;
+    // The NUT stream header already names the codec; parsers would hold the
+    // last access unit back until the following one arrives.
+    format->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_NOPARSE | AVFMT_FLAG_NOFILLIN;
+    AVPacket* packet = av_packet_alloc();
+    if (avformat_open_input(&format, nullptr, av_find_input_format("nut"), nullptr) == 0) {
+        while (av_read_frame(format, packet) == 0) {
+            const std::string_view payload(reinterpret_cast<const char*>(packet->data),
+                                           static_cast<std::size_t>(packet->size));
+            emitPacket(withFourByteStartCodes(payload), (packet->flags & AV_PKT_FLAG_KEY) != 0);
+            av_packet_unref(packet);
+        }
+        avformat_close_input(&format);
+    } else {
+        log("FFmpeg produced no NUT stream");
+        avformat_free_context(format);
     }
-    if (hasVcl && !accessUnit.empty()) {
-        emitAccessUnit(std::move(accessUnit));
-    }
+    av_packet_free(&packet);
+    av_freep(&io->buffer);
+    avio_context_free(&io);
     ::close(fd);
 }
 
-void FfmpegEncoder::consumeNal(std::string nal, std::string& accessUnit, bool& hasVcl) {
-    const auto prefix = startCodeLength(nal, 0);
-    if (nal.size() <= prefix) {
+void FfmpegEncoder::emitPacket(std::string annexB, const bool keyframe) {
+    if (annexB.empty()) {
         return;
     }
-    const int type = static_cast<unsigned char>(nal[prefix]) & 0x1f;
-    // FFmpeg's Annex-B muxer may mix three- and four-byte delimiters. The
-    // existing iOS receiver intentionally recognizes only the four-byte form,
-    // matching the macOS sender, so normalize every NAL before transmission.
-    if (prefix == 3) {
-        nal.insert(nal.begin(), '\0');
-    }
-    if (type == 9 && hasVcl) {
-        emitAccessUnit(std::move(accessUnit));
-        accessUnit.clear();
-        hasVcl = false;
-    }
-    accessUnit.append(nal);
-    hasVcl = hasVcl || (type >= 1 && type <= 5);
-}
-
-void FfmpegEncoder::emitAccessUnit(std::string accessUnit) {
     std::int64_t timestamp = wallClockMs();
     {
         std::lock_guard lock(mutex_);
@@ -382,19 +394,9 @@ void FfmpegEncoder::emitAccessUnit(std::string accessUnit) {
             timestamps_.pop_front();
         }
     }
-    bool keyframe = false;
-    for (std::size_t position = findStartCode(accessUnit, 0); position != std::string::npos;) {
-        const auto prefix = startCodeLength(accessUnit, position);
-        if (position + prefix < accessUnit.size()
-            && (static_cast<unsigned char>(accessUnit[position + prefix]) & 0x1f) == 5) {
-            keyframe = true;
-            break;
-        }
-        position = findStartCode(accessUnit, position + prefix);
-    }
     if (callback_) {
         callback_(EncodedFrame{.capturedAtMs = timestamp, .keyframe = keyframe,
-                               .annexB = std::move(accessUnit)});
+                               .annexB = std::move(annexB)});
     }
 }
 

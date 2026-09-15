@@ -26,6 +26,10 @@ struct EncoderConfig {
 
 /// Low-latency FFmpeg subprocess adapter. Capture threads only replace a
 /// single pending frame, preventing latency from growing under encoder load.
+/// FFmpeg writes packetized NUT, so every access unit is delivered as soon as
+/// its packet is complete, without waiting for the next frame.
+/// FFmpeg writes packetized NUT so every encoded frame is delivered as soon
+/// as its packet is complete, without waiting for the next frame.
 class FfmpegEncoder {
 public:
     using FrameCallback = std::function<void(EncodedFrame)>;
@@ -40,14 +44,15 @@ public:
     void requestKeyframe();
     void stop();
     [[nodiscard]] std::string selectedEncoder() const;
+    /// Set when the encoder gave up after a fatal FFmpeg error; empty otherwise.
+    [[nodiscard]] std::string failure() const;
 
 private:
     void run();
     void startProcess(const VideoFormat& input);
     void stopProcess();
     void readOutput(int fd);
-    void consumeNal(std::string nal, std::string& accessUnit, bool& hasVcl);
-    void emitAccessUnit(std::string accessUnit);
+    void emitPacket(std::string annexB, bool keyframe);
     std::vector<std::string> arguments(const VideoFormat& input) const;
     EncoderKind chooseEncoder() const;
 
@@ -66,6 +71,7 @@ private:
     int childPid_ = -1;
     VideoFormat inputFormat_;
     EncoderKind selected_ = EncoderKind::Software;
+    std::string failure_;
 };
 
 }  // namespace od
