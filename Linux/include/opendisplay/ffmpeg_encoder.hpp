@@ -19,8 +19,6 @@ namespace od {
 struct EncoderConfig {
     EncoderKind kind = EncoderKind::Auto;
     std::string vaapiDevice = "/dev/dri/renderD128";
-    int outputWidth = 0;
-    int outputHeight = 0;
     int fps = 60;
     int bitrate = 18'000'000;
 };
@@ -45,6 +43,12 @@ public:
     [[nodiscard]] std::string selectedEncoder() const;
     /// Set when the encoder gave up after a fatal FFmpeg error; empty otherwise.
     [[nodiscard]] std::string failure() const;
+    /// Frames replaced in the pending slot before FFmpeg took them, over the
+    /// encoder's lifetime; the receiver shows it as a running total.
+    [[nodiscard]] std::uint64_t droppedFrames() const;
+    /// Frames accepted but not yet returned as packets: the pending slot plus
+    /// every frame written to FFmpeg whose packet is still outstanding.
+    [[nodiscard]] int pendingFrames() const;
 
 private:
     void run();
@@ -62,6 +66,7 @@ private:
     std::condition_variable condition_;
     std::optional<CapturedFrame> pending_;
     std::deque<std::int64_t> timestamps_;
+    std::uint64_t dropped_ = 0;
     std::thread worker_;
     std::thread reader_;
     bool running_ = false;

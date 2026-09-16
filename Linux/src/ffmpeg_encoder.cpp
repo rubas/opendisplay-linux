@@ -29,16 +29,6 @@ extern char** environ;
 namespace od {
 namespace {
 
-std::string pixelFormatName(const VideoFormat::PixelFormat format) {
-    switch (format) {
-    case VideoFormat::PixelFormat::Bgra: return "bgra";
-    case VideoFormat::PixelFormat::Bgrx: return "bgr0";
-    case VideoFormat::PixelFormat::Rgba: return "rgba";
-    case VideoFormat::PixelFormat::Rgbx: return "rgb0";
-    }
-    return "bgra";
-}
-
 std::string encoderName(const EncoderKind kind) {
     switch (kind) {
     case EncoderKind::Vaapi: return "h264_vaapi";
@@ -174,9 +164,22 @@ void FfmpegEncoder::submit(CapturedFrame frame) {
         if (!running_) {
             return;
         }
+        if (pending_) {
+            ++dropped_;
+        }
         pending_ = std::move(frame);
     }
     condition_.notify_one();
+}
+
+std::uint64_t FfmpegEncoder::droppedFrames() const {
+    std::lock_guard lock(mutex_);
+    return dropped_;
+}
+
+int FfmpegEncoder::pendingFrames() const {
+    std::lock_guard lock(mutex_);
+    return static_cast<int>(timestamps_.size()) + (pending_ ? 1 : 0);
 }
 
 void FfmpegEncoder::requestKeyframe() {
@@ -261,8 +264,6 @@ EncoderKind FfmpegEncoder::chooseEncoder() const {
 }
 
 std::vector<std::string> FfmpegEncoder::arguments(const VideoFormat& input) const {
-    const int outputWidth = config_.outputWidth > 0 ? config_.outputWidth : input.width;
-    const int outputHeight = config_.outputHeight > 0 ? config_.outputHeight : input.height;
     const std::string size = std::to_string(input.width) + "x" + std::to_string(input.height);
     const std::string rate = std::to_string(std::max(1, config_.fps));
     std::vector<std::string> args{
@@ -271,24 +272,20 @@ std::vector<std::string> FfmpegEncoder::arguments(const VideoFormat& input) cons
     if (selected_ == EncoderKind::Vaapi) {
         args.insert(args.end(), {"-vaapi_device", config_.vaapiDevice});
     }
+    // Frames arrive as NV12 at the output size, the 8-bit 4:2:0 layout every
+    // encoder takes directly and the iPad hardware decoder requires.
     args.insert(args.end(), {
-        "-f", "rawvideo", "-pixel_format", pixelFormatName(input.pixelFormat),
-        "-video_size", size, "-framerate", rate, "-i", "pipe:0", "-an",
+        "-f", "rawvideo", "-pixel_format", "nv12", "-video_size", size, "-framerate", rate,
+        "-i", "pipe:0", "-an",
     });
-
-    const std::string scale = "scale=" + std::to_string(outputWidth) + ':'
-        + std::to_string(outputHeight) + ":flags=fast_bilinear";
-    // iPad hardware decoders accept 8-bit 4:2:0 only; without an explicit
-    // format libx264 would pick High 4:4:4 Predictive for RGB input.
     if (selected_ == EncoderKind::Vaapi) {
-        args.insert(args.end(), {"-vf", scale + ",format=nv12,hwupload", "-c:v", "h264_vaapi",
-                                 "-async_depth", "1"});
+        args.insert(args.end(), {"-vf", "hwupload", "-c:v", "h264_vaapi", "-async_depth", "1"});
     } else if (selected_ == EncoderKind::Nvenc) {
-        args.insert(args.end(), {"-vf", scale + ",format=yuv420p", "-c:v", "h264_nvenc",
-                                 "-preset", "p1", "-tune", "ull", "-delay", "0"});
+        args.insert(args.end(), {"-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull",
+                                 "-delay", "0"});
     } else {
-        args.insert(args.end(), {"-vf", scale + ",format=yuv420p", "-c:v", "libx264",
-                                 "-preset", "ultrafast", "-tune", "zerolatency"});
+        args.insert(args.end(), {"-c:v", "libx264", "-preset", "ultrafast", "-tune",
+                                 "zerolatency"});
     }
     // NUT carries packet boundaries, so the reader emits each access unit as
     // soon as FFmpeg flushes it instead of waiting for the next start code.
@@ -394,8 +391,7 @@ void FfmpegEncoder::run() {
             }
             const bool formatChanged = inputFd_ >= 0
                 && (frame.format.width != inputFormat_.width
-                    || frame.format.height != inputFormat_.height
-                    || frame.format.pixelFormat != inputFormat_.pixelFormat);
+                    || frame.format.height != inputFormat_.height);
             if (restart || formatChanged) {
                 stopProcess();
             }

@@ -89,8 +89,6 @@ void Session::startPipeline(const PhoneInfo& phone) {
         encoder_.start(EncoderConfig{
             .kind = options_.encoder,
             .vaapiDevice = options_.vaapiDevice,
-            .outputWidth = outputWidth,
-            .outputHeight = outputHeight,
             .fps = options_.fps,
             .bitrate = options_.bitrate,
         }, [this](EncodedFrame frame) {
@@ -101,9 +99,8 @@ void Session::startPipeline(const PhoneInfo& phone) {
         });
         pipewireFdHandedOff = true;
         capture_.start(capture.pipewireFd, capture.stream.nodeId, capture.captureWidth,
-                       capture.captureHeight, options_.fps, [this](CapturedFrame frame) {
-                           encoder_.submit(std::move(frame));
-                       });
+                       capture.captureHeight, outputWidth, outputHeight, options_.fps,
+                       [this](CapturedFrame frame) { encoder_.submit(std::move(frame)); });
         pipelineRunning_ = true;
         activePhone_ = phone;
         log("Streaming " + std::to_string(outputWidth) + 'x' + std::to_string(outputHeight)
@@ -253,10 +250,13 @@ bool Session::tick() {
         startPipeline(current);
     }
     if (connected_.load() && now - lastPing_ >= std::chrono::seconds(2)) {
-        const QJsonObject ping{{QStringLiteral("type"), QStringLiteral("ping")},
-                               {QStringLiteral("encDrops"), 0},
-                               {QStringLiteral("netDrops"), 0},
-                               {QStringLiteral("pending"), 0}};
+        // Same fields as the Mac sender: totals for drops, the current queue
+        // depth for pending. send() blocks, so nothing is dropped on the network side.
+        const QJsonObject ping{
+            {QStringLiteral("type"), QStringLiteral("ping")},
+            {QStringLiteral("encDrops"), static_cast<qint64>(encoder_.droppedFrames())},
+            {QStringLiteral("netDrops"), 0},
+            {QStringLiteral("pending"), encoder_.pendingFrames()}};
         send(QJsonDocument(ping).toJson(QJsonDocument::Compact).toStdString());
         lastPing_ = now;
     }
